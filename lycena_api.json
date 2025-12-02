@@ -1,0 +1,17 @@
+{
+    "studentFound": {
+        "email": "mystik643@gmail.com",
+        "name": "",
+        "nickname": "Skander baldi",
+        "subscriptions": [],
+        "role": "Student",
+        "niveau": "Troisième",
+        "branche": "Informatique",
+        "option": "Allemand",
+        "activeToken": "",
+        "activeTokenList": [],
+        "hubSpot": true,
+        "niveauMatiereList": [],
+        "affectedNiveauMatiereList": []
+    }
+}

