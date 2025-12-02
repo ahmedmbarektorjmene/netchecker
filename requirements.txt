@@ -1,0 +1,7 @@
+httpx
+json
+asyncio
+colorama
+dnspython
+dnslib
+websockets
